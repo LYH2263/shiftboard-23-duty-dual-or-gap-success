@@ -29,7 +29,9 @@ onMounted(async () => {
       <div class="panel">
         <h2>责任区值班态</h2>
         <table>
-          <thead><tr><th>责任区</th><th>当前值班班次</th><th>值班人</th><th>持权起始</th></tr></thead>
+          <thead>
+            <tr><th>责任区</th><th>当前值班班次</th><th>值班人</th><th>持权起始</th><th>最近切换证明</th></tr>
+          </thead>
           <tbody>
             <tr v-for="z in data.责任区值班" :key="z.id">
               <td>{{ z.name }}</td>
@@ -39,6 +41,10 @@ onMounted(async () => {
               </td>
               <td>{{ z.keeper || '—' }}</td>
               <td>{{ z.since || '—' }}</td>
+              <td>
+                <template v-if="z.handover_id">交班单 #{{ z.handover_id }}</template>
+                <span v-else style="color:var(--muted)">初始值班</span>
+              </td>
             </tr>
           </tbody>
         </table>

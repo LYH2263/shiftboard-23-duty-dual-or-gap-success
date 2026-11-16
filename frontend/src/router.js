@@ -5,6 +5,7 @@ import Zones from './pages/Zones.vue'
 import Batches from './pages/Batches.vue'
 import HandoverDesk from './pages/HandoverDesk.vue'
 import HandoverLogs from './pages/HandoverLogs.vue'
+import DutyTransitions from './pages/DutyTransitions.vue'
 import Reconcile from './pages/Reconcile.vue'
 import Denials from './pages/Denials.vue'
 
@@ -17,6 +18,7 @@ export default createRouter({
     { path: '/batches', component: Batches },
     { path: '/handover', component: HandoverDesk },
     { path: '/logs', component: HandoverLogs },
+    { path: '/transitions', component: DutyTransitions },
     { path: '/reconcile', component: Reconcile },
     { path: '/denials', component: Denials },
   ],

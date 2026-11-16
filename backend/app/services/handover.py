@@ -2,14 +2,18 @@
 
 约束落点：
 1. duty_holders.zone_id 主键 —— 同一责任区至多一个值班班次（数据库级保证）；
-2. 完成交班时对每个责任区执行条件 UPDATE（WHERE shift_id = 交班方），
-   rowcount 不为 1 即整事务回滚 —— 杜绝“卸任成功就任失败”的空窗与假成功；
-3. 发起前对清单内【每个】责任区逐一校验双方资格与单值班约束，任一不过整单拒绝。
+2. 完成交班时对每个责任区执行条件原地 UPDATE（WHERE shift_id = 交班方），
+   一条 UPDATE 同时完成卸任+就任，不存在先删后插的空窗；rowcount 不为 1
+   即整事务回滚 —— 杜绝“卸任成功就任失败”的空窗与假成功；
+3. 每次切换逐区追加 duty_transitions 持久化证明（区、旧值班、新值班、
+   切换时刻、交班单 id），与业务数据同库同源，只读接口可按区/交班单查询；
+4. 发起前对清单内【每个】责任区逐一校验双方资格与单值班约束，任一不过整单拒绝。
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 
 from fastapi import HTTPException
 
@@ -98,6 +102,7 @@ def list_handovers() -> list[dict]:
         )
         for h in rows:
             h["zones"] = _handover_zones(conn, h["id"])
+            h["transitions"] = duty.transitions_for_handover(conn, h["id"])
         return rows
 
 
@@ -146,6 +151,7 @@ def get_handover(handover_id: int) -> dict:
         out = dict(h)
         out["items"] = rows_to_dicts(items)
         out["zones"] = _handover_zones(conn, handover_id)
+        out["transitions"] = duty.transitions_for_handover(conn, handover_id)
         return out
 
 
@@ -161,7 +167,8 @@ def dashboard() -> dict:
         zones = rows_to_dicts(
             conn.execute(
                 """
-                SELECT z.id, z.name, dh.shift_id, s.name AS shift_name, s.keeper, dh.since
+                SELECT z.id, z.name, dh.shift_id, s.name AS shift_name, s.keeper,
+                       dh.since, dh.handover_id
                 FROM zones z
                 LEFT JOIN duty_holders dh ON dh.zone_id = z.id
                 LEFT JOIN shifts s ON s.id = dh.shift_id
@@ -353,23 +360,30 @@ def complete_handover(handover_id: int) -> dict:
                 raise HTTPException(409, reason)
 
             now = _now()
-            # 同事务逐区原子切换：卸任交班方 + 就任接班方是一条原地 UPDATE，
-            # 不存在先删后插的空窗；条件不满足则 rowcount=0，整单回滚。
+            # 同事务逐区原子切换：一条原地条件 UPDATE 同时完成
+            # “交班方卸任 + 接班方就任”，没有先删后插的空窗；
+            # 持权者已被并发改写时 WHERE 不命中 => rowcount=0，整单回滚。
             for zid in zones:
-                conn.execute("DELETE FROM duty_holders WHERE zone_id = ?", (zid,))
-                conn.execute(
+                cur = conn.execute(
                     """
-                    INSERT INTO duty_holders(zone_id, shift_id, since, handover_id)
-                    VALUES (?, ?, ?, ?)
+                    UPDATE duty_holders
+                       SET shift_id = ?, since = ?, handover_id = ?
+                     WHERE zone_id = ? AND shift_id = ?
                     """,
-                    (zid, h["from_shift_id"], now, handover_id),
+                    (h["to_shift_id"], now, handover_id, zid, h["from_shift_id"]),
                 )
+                if cur.rowcount != 1:
+                    raise _HandoverConflict(
+                        f"责任区#{zid}值班权已被改写，条件切换未生效"
+                    )
+                # 持久化值班切换证明：区、旧值班、新值班、切换时刻、交班单 id
                 conn.execute(
                     """
-                    INSERT INTO duty_holders(zone_id, shift_id, since, handover_id)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO duty_transitions(
+                      zone_id, from_shift_id, to_shift_id, handover_id, switched_at
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
-                    (zid, h["to_shift_id"], now, handover_id),
+                    (zid, h["from_shift_id"], h["to_shift_id"], handover_id, now),
                 )
 
             # 清单批次整批过户（仅在途），与值班权切换同一事务
@@ -439,8 +453,12 @@ def complete_handover(handover_id: int) -> dict:
                 ),
             )
             conn.commit()
-    except _HandoverConflict as exc:
-        # with 块退出即回滚；留痕后报错，绝不允许标注交班成功
+    except (
+        _HandoverConflict,
+        sqlite3.IntegrityError,
+    ) as exc:
+        # with 块退出即回滚；留痕后报错，绝不允许标注交班成功。
+        # IntegrityError：触发器拦截无资格就任（如并发移除接班方资格）。
         duty.record_denial(
             "完成交班",
             f"交班单#{handover_id}原子切换失败并已回滚：{exc}",

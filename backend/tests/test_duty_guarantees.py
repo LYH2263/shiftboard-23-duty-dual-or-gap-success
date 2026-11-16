@@ -37,12 +37,18 @@ def test_duty_holders_unique_per_zone(fresh_db):
 
 
 def test_unqualified_shift_cannot_hold_duty(fresh_db):
-    """未绑定责任区的班次不能就任值班权（外键经 shift_zones 校验）。"""
+    """未绑定责任区的班次不能就任值班权（触发器经 shift_zones 校验）。"""
     conn = fresh_db.connect()
     # 晚班#2 未绑定 Z2，直接插 Z2->#2 必须失败
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO duty_holders(zone_id, shift_id, since) VALUES (2, 2, 'x')"
+        )
+    conn.rollback()
+    # UPDATE 路径同样拦截：把 Z1 持权改成未绑定 Z1 的夜班#3
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE duty_holders SET shift_id = 3 WHERE zone_id = 1"
         )
     conn.rollback()
     conn.close()
@@ -102,6 +108,82 @@ def test_service_rollback_on_conflict(fresh_db):
         (hid,),
     ).fetchone()
     assert denial is not None and "回滚" in denial["reason"]
+    conn.close()
+
+
+def test_broken_dual_duty_schema_is_repaired(tmp_path, monkeypatch):
+    """植入回归的旧库（代理 id 主键、同区双值班行）启动后自动修复为单值班。"""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "broken"))
+    monkeypatch.setenv("FIXTURES_DIR", str(ROOT / "fixtures"))
+    from app import db as db_mod, seed
+
+    conn = db_mod.connect()
+    conn.executescript(
+        """
+        CREATE TABLE zones (id INTEGER PRIMARY KEY, code TEXT UNIQUE, name TEXT);
+        CREATE TABLE shifts (
+          id INTEGER PRIMARY KEY, name TEXT UNIQUE, keeper TEXT, status TEXT);
+        CREATE TABLE shift_zones (
+          shift_id INTEGER REFERENCES shifts(id), zone_id INTEGER REFERENCES zones(id),
+          PRIMARY KEY(shift_id, zone_id));
+        CREATE TABLE batches (id INTEGER PRIMARY KEY, biz_key TEXT UNIQUE, title TEXT,
+          owner_shift_id INTEGER, zone_id INTEGER, status TEXT, note TEXT DEFAULT '');
+        CREATE TABLE handovers (id INTEGER PRIMARY KEY, from_shift_id INTEGER,
+          to_shift_id INTEGER, status TEXT, batch_count INTEGER, reason TEXT DEFAULT '',
+          started_at TEXT, finished_at TEXT);
+        -- 回归现场：代理 id 主键，zone_id 可重复
+        CREATE TABLE duty_holders (
+          id INTEGER PRIMARY KEY,
+          zone_id INTEGER NOT NULL,
+          shift_id INTEGER NOT NULL,
+          since TEXT NOT NULL,
+          handover_id INTEGER);
+        INSERT INTO zones VALUES (1,'Z-A','华北'),(2,'Z-B','华东');
+        INSERT INTO shifts VALUES (1,'早班','阿陈','值班中'),(2,'晚班','小林','值班中'),
+                                   (3,'夜班','老周','空闲');
+        INSERT INTO shift_zones VALUES (1,1),(2,1),(1,2),(3,2);
+        INSERT INTO handovers VALUES (1,1,2,'已完成',1,'','t0','t0');
+        -- Z1 双值班：#1 与 #2 同时持权
+        INSERT INTO duty_holders VALUES
+          (1,1,1,'t0',NULL),(2,1,2,'t1',1),(3,2,1,'t0',NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    seed.init_db()
+
+    conn = db_mod.connect()
+    # zone_id 成为主键，双值班被合并为一行（保留最新持权 #2）
+    pk = [r["name"] for r in conn.execute("PRAGMA table_info(duty_holders)") if r["pk"]]
+    assert pk == ["zone_id"]
+    dup = conn.execute(
+        "SELECT zone_id, COUNT(*) c FROM duty_holders GROUP BY zone_id HAVING c > 1"
+    ).fetchall()
+    assert dup == []
+    z1 = conn.execute(
+        "SELECT shift_id FROM duty_holders WHERE zone_id = 1"
+    ).fetchone()
+    assert z1["shift_id"] == 2
+    # 切换证明表与触发器就位
+    assert conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='duty_transitions'"
+    ).fetchone()
+    triggers = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'"
+        )
+    }
+    assert {
+        "trg_duty_holders_qualified_insert",
+        "trg_duty_holders_qualified_update",
+    } <= triggers
+    # 修复后约束仍生效：同区第二个持权行插不进去
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO duty_holders(zone_id, shift_id, since) VALUES (1, 1, 'x')"
+        )
+    conn.rollback()
     conn.close()
 
 

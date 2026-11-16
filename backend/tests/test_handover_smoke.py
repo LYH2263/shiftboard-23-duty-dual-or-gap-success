@@ -209,6 +209,74 @@ def test_parallel_handover_on_same_zone_rejected(client):
     client.post(f"/api/handovers/{first.json()['id']}/complete")
 
 
+def test_duty_transition_proof_api_and_same_source(client):
+    """切换证明只读接口可按责任区/交班单查，交班详情与责任区界面同源带证明。"""
+    # 此时点 Z2 持权者为早班#1，夜班#3 绑定 Z2，交回给#3
+    started = client.post(
+        "/api/handovers/start",
+        json={"from_shift_id": 1, "to_shift_id": 3, "zone_ids": [2]},
+    )
+    assert started.status_code == 200, started.text
+    hid = started.json()["id"]
+    done = client.post(f"/api/handovers/{hid}/complete")
+    assert done.status_code == 200, done.text
+
+    # 只读接口：按交班单 id
+    by_h = client.get("/api/duty-transitions", params={"handover_id": hid}).json()
+    assert len(by_h) == 1
+    proof = by_h[0]
+    assert proof["zone_id"] == 2
+    assert proof["from_shift_id"] == 1
+    assert proof["to_shift_id"] == 3
+    assert proof["handover_id"] == hid
+    assert proof["switched_at"]
+    assert proof["zone_name"] == "华东责任区"
+    assert proof["from_shift_name"] == "早班"
+    assert proof["to_shift_name"] == "夜班"
+
+    # 只读接口：按责任区
+    by_z = client.get("/api/duty-transitions", params={"zone_id": 2}).json()
+    assert any(p["handover_id"] == hid for p in by_z)
+    assert all(p["zone_id"] == 2 for p in by_z)
+
+    # 交班详情内嵌证明，与独立接口同源
+    detail = client.get(f"/api/handovers/{hid}").json()
+    assert len(detail["transitions"]) == 1
+    assert detail["transitions"][0]["id"] == proof["id"]
+    listed = next(h for h in client.get("/api/handovers").json() if h["id"] == hid)
+    assert listed["transitions"][0]["id"] == proof["id"]
+
+    # 责任区界面带当前值班与最近切换证明字段
+    z2 = next(z for z in client.get("/api/zones").json() if z["id"] == 2)
+    assert z2["duty_shift_id"] == 3
+    last = z2["last_transition"]
+    assert last is not None
+    assert last["handover_id"] == hid
+    assert last["from_shift_id"] == 1 and last["to_shift_id"] == 3
+
+
+def test_no_dual_duty_and_no_gap_after_every_completion(client):
+    """任意时刻不变量：每区恰好一行持权（无双值班、无空窗）。"""
+    with connect() as conn:
+        # 全流程跑完后逐区核对
+        dup = conn.execute(
+            "SELECT zone_id, COUNT(*) c FROM duty_holders GROUP BY zone_id HAVING c <> 1"
+        ).fetchall()
+        assert dup == []
+        zone_total = conn.execute("SELECT COUNT(*) c FROM zones").fetchone()["c"]
+        holder_total = conn.execute("SELECT COUNT(*) c FROM duty_holders").fetchone()["c"]
+        assert holder_total == zone_total
+        # 证明条数 = 已完成交班覆盖的责任区次数
+        proof_count = conn.execute(
+            "SELECT COUNT(*) c FROM duty_transitions"
+        ).fetchone()["c"]
+        covered = conn.execute(
+            "SELECT COUNT(*) c FROM handover_zones hz "
+            "JOIN handovers h ON h.id = hz.handover_id WHERE h.status = '已完成'"
+        ).fetchone()["c"]
+        assert proof_count == covered
+
+
 def test_denials_query_filters(client):
     """失败原因可按操作类型/责任区/班次过滤，且与业务库同源。"""
     all_denials = client.get("/api/denials").json()

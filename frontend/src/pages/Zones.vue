@@ -46,6 +46,20 @@ onMounted(async () => {
               </span>
             </td>
           </tr>
+          <tr>
+            <th>最近值班切换证明</th>
+            <td>
+              <template v-if="z.last_transition">
+                <span class="tag">证明 #{{ z.last_transition.id }}</span>
+                {{ z.last_transition.from_shift_name || '—' }}
+                → <span class="tag on">{{ z.last_transition.to_shift_name }}</span>
+                <span style="margin-left:8px;color:var(--muted);font-size:12px">
+                  {{ z.last_transition.switched_at }} · 交班单 #{{ z.last_transition.handover_id }}
+                </span>
+              </template>
+              <span v-else style="color:var(--muted)">尚无切换记录（初始值班）</span>
+            </td>
+          </tr>
         </tbody>
       </table>
     </div>

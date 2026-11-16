@@ -6,6 +6,10 @@ from pathlib import Path
 from app.db import connect, fixtures_dir
 
 
+# 独立值班权表：责任区 -> 当前值班班次。
+# zone_id 主键 => 同一责任区同一时刻至多一个值班班次（数据库级，应用层无法插第二行）；
+# 就任资格由触发器经 shift_zones 校验（SQLite 无法对复合键建外键，用触发器等价保证）；
+# duty_transitions 为持久化值班切换证明：区、旧值班、新值班、切换时刻、交班单 id。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS zones (
   id INTEGER PRIMARY KEY,
@@ -17,16 +21,47 @@ CREATE TABLE IF NOT EXISTS shift_zones (
   zone_id INTEGER NOT NULL REFERENCES zones(id),
   PRIMARY KEY (shift_id, zone_id)
 );
--- 独立值班权表：责任区 -> 当前值班班次。
--- zone_id 唯一 => 同一责任区同一时刻至多一个值班班次；
--- 配合 shift_zones 外键 => 只有具备该区值班资格的班次才能就任。
 CREATE TABLE IF NOT EXISTS duty_holders (
-  id INTEGER PRIMARY KEY,
-  zone_id INTEGER NOT NULL REFERENCES zones(id),
+  zone_id INTEGER PRIMARY KEY REFERENCES zones(id),
   shift_id INTEGER NOT NULL REFERENCES shifts(id),
   since TEXT NOT NULL,
   handover_id INTEGER REFERENCES handovers(id)
 );
+CREATE TRIGGER IF NOT EXISTS trg_duty_holders_qualified_insert
+BEFORE INSERT ON duty_holders
+BEGIN
+  SELECT CASE
+    WHEN NOT EXISTS (
+      SELECT 1 FROM shift_zones
+      WHERE shift_id = NEW.shift_id AND zone_id = NEW.zone_id
+    )
+    THEN RAISE(ABORT, '该班次未绑定此责任区，无值班资格，禁止就任')
+  END;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_duty_holders_qualified_update
+BEFORE UPDATE OF zone_id, shift_id ON duty_holders
+BEGIN
+  SELECT CASE
+    WHEN NOT EXISTS (
+      SELECT 1 FROM shift_zones
+      WHERE shift_id = NEW.shift_id AND zone_id = NEW.zone_id
+    )
+    THEN RAISE(ABORT, '该班次未绑定此责任区，无值班资格，禁止就任')
+  END;
+END;
+-- 值班切换证明（只追加，不更新不删除）：每次完成交班逐区落一行
+CREATE TABLE IF NOT EXISTS duty_transitions (
+  id INTEGER PRIMARY KEY,
+  zone_id INTEGER NOT NULL REFERENCES zones(id),
+  from_shift_id INTEGER REFERENCES shifts(id),
+  to_shift_id INTEGER NOT NULL REFERENCES shifts(id),
+  handover_id INTEGER NOT NULL REFERENCES handovers(id),
+  switched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_duty_transitions_zone
+  ON duty_transitions(zone_id, switched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_duty_transitions_handover
+  ON duty_transitions(handover_id);
 CREATE TABLE IF NOT EXISTS handover_zones (
   handover_id INTEGER NOT NULL REFERENCES handovers(id),
   zone_id INTEGER NOT NULL REFERENCES zones(id),
@@ -67,11 +102,101 @@ def _column_exists(conn, table: str, column: str) -> bool:
     return any(r["name"] == column for r in conn.execute(f"PRAGMA table_info({table})"))
 
 
+def _duty_holders_schema_broken(conn) -> bool:
+    """植入回归的旧库：duty_holders 用代理 id 主键、zone_id 可重复（双值班）。"""
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(duty_holders)")}
+    if "zone_id" not in cols:
+        return True
+    # zone_id 不是主键 => 同一责任区可写多行，约束失效
+    return not bool(cols["zone_id"]["pk"])
+
+
+def _rebuild_duty_holders(conn) -> None:
+    """把被破坏的值班权表重建为 zone_id 主键表，并合并已产生的双值班行。
+
+    同一责任区多行时保留“最近一次切换”的持权行（handover_id 最大，
+    其次 since 最新、id 最大），其余删除；重建后由主键与触发器兜底。
+    """
+    rows = conn.execute(
+        """
+        SELECT zone_id, shift_id, since, handover_id FROM duty_holders
+        ORDER BY zone_id,
+                 COALESCE(handover_id, -1),
+                 since,
+                 rowid DESC
+        """
+    ).fetchall()
+    keep: dict[int, dict] = {}
+    for r in rows:  # 排序后同区最后一行即最新持权
+        keep[r["zone_id"]] = dict(r)
+
+    conn.execute("DROP TRIGGER IF EXISTS trg_duty_holders_qualified_insert")
+    conn.execute("DROP TRIGGER IF EXISTS trg_duty_holders_qualified_update")
+    conn.execute("DROP TABLE IF EXISTS duty_holders_old")
+    conn.execute("ALTER TABLE duty_holders RENAME TO duty_holders_old")
+    conn.execute(
+        """
+        CREATE TABLE duty_holders (
+          zone_id INTEGER PRIMARY KEY REFERENCES zones(id),
+          shift_id INTEGER NOT NULL REFERENCES shifts(id),
+          since TEXT NOT NULL,
+          handover_id INTEGER REFERENCES handovers(id)
+        )
+        """
+    )
+    for zid, row in keep.items():
+        # 只回填仍具备资格的持权；不臆造无资格值班权（交给人工/后续交班修复）
+        qualified = conn.execute(
+            "SELECT 1 FROM shift_zones WHERE zone_id = ? AND shift_id = ?",
+            (zid, row["shift_id"]),
+        ).fetchone()
+        if qualified:
+            conn.execute(
+                """
+                INSERT INTO duty_holders(zone_id, shift_id, since, handover_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (zid, row["shift_id"], row["since"], row["handover_id"]),
+            )
+    conn.execute("DROP TABLE duty_holders_old")
+    conn.executescript(
+        """
+        CREATE TRIGGER trg_duty_holders_qualified_insert
+        BEFORE INSERT ON duty_holders
+        BEGIN
+          SELECT CASE
+            WHEN NOT EXISTS (
+              SELECT 1 FROM shift_zones
+              WHERE shift_id = NEW.shift_id AND zone_id = NEW.zone_id
+            )
+            THEN RAISE(ABORT, '该班次未绑定此责任区，无值班资格，禁止就任')
+          END;
+        END;
+        CREATE TRIGGER trg_duty_holders_qualified_update
+        BEFORE UPDATE OF zone_id, shift_id ON duty_holders
+        BEGIN
+          SELECT CASE
+            WHEN NOT EXISTS (
+              SELECT 1 FROM shift_zones
+              WHERE shift_id = NEW.shift_id AND zone_id = NEW.zone_id
+            )
+            THEN RAISE(ABORT, '该班次未绑定此责任区，无值班资格，禁止就任')
+          END;
+        END;
+        """
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         # shifts / batches / handovers / handover_items / reconcile_reports
         # 沿用历史建表语句，保证老库与新库结构一致
         conn.executescript(_LEGACY_SCHEMA)
+
+        if _table_exists(conn, "duty_holders") and _duty_holders_schema_broken(conn):
+            # 修复植入回归的旧库：先重建值班权表（清双值班），再建新表与触发器
+            _rebuild_duty_holders(conn)
+
         conn.executescript(SCHEMA)
 
         for table, column, ddl in LEGACY_MIGRATIONS:

@@ -136,6 +136,44 @@ async function complete() {
           </tr>
         </tbody>
       </table>
+      <h3 style="margin:12px 0 6px;font-size:14px">值班切换证明（完成后同事务落库）</h3>
+      <table v-if="current.transitions && current.transitions.length">
+        <thead>
+          <tr><th>证明</th><th>责任区</th><th>旧值班</th><th>新值班</th><th>切换时刻</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="t in current.transitions" :key="t.id">
+            <td>#{{ t.id }}</td>
+            <td>{{ t.zone_name }}</td>
+            <td>{{ t.from_shift_name || '—' }}</td>
+            <td><span class="tag on">{{ t.to_shift_name }}</span></td>
+            <td style="white-space:nowrap">{{ t.switched_at }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else style="color:var(--muted);font-size:12px">
+        尚未完成：无切换证明，值班权仍属交班方，不会空窗也不会假成功。
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>各责任区当前值班</h2>
+      <table>
+        <thead><tr><th>责任区</th><th>当前值班班次</th><th>值班人</th><th>持权起始</th></tr></thead>
+        <tbody>
+          <tr v-for="z in zones" :key="z.id">
+            <td>{{ z.name }}</td>
+            <td>
+              <span v-if="z.duty_shift_id" class="tag on">
+                {{ z.duty_shift_name }}（#{{ z.duty_shift_id }}）
+              </span>
+              <span v-else class="tag">无值班（空窗）</span>
+            </td>
+            <td>{{ z.duty_keeper || '—' }}</td>
+            <td>{{ z.duty_since || '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </template>

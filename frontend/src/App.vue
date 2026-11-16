@@ -14,6 +14,7 @@
         <router-link to="/batches">在途批次</router-link>
         <router-link to="/handover">交班办理</router-link>
         <router-link to="/logs">交班记录</router-link>
+        <router-link to="/transitions">切换证明</router-link>
         <router-link to="/reconcile">交班对账</router-link>
         <router-link to="/denials">操作留痕</router-link>
       </nav>

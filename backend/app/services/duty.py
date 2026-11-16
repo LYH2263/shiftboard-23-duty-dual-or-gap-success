@@ -90,6 +90,63 @@ def list_denials(
     return rows
 
 
+# ---------------------------------------------------------------- 值班切换证明
+
+def list_transitions(
+    zone_id: int | None = None,
+    handover_id: int | None = None,
+) -> list[dict]:
+    """值班切换证明只读查询：可按责任区或交班单 id 过滤，同库同源。"""
+    sql = """
+        SELECT t.id, t.zone_id, t.from_shift_id, t.to_shift_id,
+               t.handover_id, t.switched_at,
+               z.code AS zone_code, z.name AS zone_name,
+               fs.name AS from_shift_name, fs.keeper AS from_keeper,
+               ts.name AS to_shift_name, ts.keeper AS to_keeper
+        FROM duty_transitions t
+        JOIN zones z ON z.id = t.zone_id
+        LEFT JOIN shifts fs ON fs.id = t.from_shift_id
+        JOIN shifts ts ON ts.id = t.to_shift_id
+    """
+    conds, params = [], []
+    if zone_id is not None:
+        conds.append("t.zone_id = ?")
+        params.append(zone_id)
+    if handover_id is not None:
+        conds.append("t.handover_id = ?")
+        params.append(handover_id)
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY t.switched_at DESC, t.id DESC"
+    with connect() as conn:
+        return rows_to_dicts(conn.execute(sql, params).fetchall())
+
+
+def transitions_for_handover(conn, handover_id: int) -> list[dict]:
+    """同一连接内取某交班单的切换证明（供交班详情同源展示）。
+
+    字段与 list_transitions 完全一致，保证界面与只读接口同形同数。
+    """
+    return rows_to_dicts(
+        conn.execute(
+            """
+            SELECT t.id, t.zone_id, t.from_shift_id, t.to_shift_id,
+                   t.handover_id, t.switched_at,
+                   z.code AS zone_code, z.name AS zone_name,
+                   fs.name AS from_shift_name, fs.keeper AS from_keeper,
+                   ts.name AS to_shift_name, ts.keeper AS to_keeper
+            FROM duty_transitions t
+            JOIN zones z ON z.id = t.zone_id
+            LEFT JOIN shifts fs ON fs.id = t.from_shift_id
+            JOIN shifts ts ON ts.id = t.to_shift_id
+            WHERE t.handover_id = ?
+            ORDER BY t.zone_id
+            """,
+            (handover_id,),
+        ).fetchall()
+    )
+
+
 # ---------------------------------------------------------------- 查询
 
 def list_zones() -> list[dict]:
@@ -98,6 +155,7 @@ def list_zones() -> list[dict]:
             conn.execute(
                 """
                 SELECT z.*, dh.shift_id AS duty_shift_id, dh.since AS duty_since,
+                       dh.handover_id AS duty_handover_id,
                        s.name AS duty_shift_name, s.keeper AS duty_keeper
                 FROM zones z
                 LEFT JOIN duty_holders dh ON dh.zone_id = z.id
@@ -119,6 +177,21 @@ def list_zones() -> list[dict]:
                     (z["id"],),
                 ).fetchall()
             )
+            # 最近一次值班切换证明（无则 None），与当前值班同源可查
+            last = conn.execute(
+                """
+                SELECT t.*, fs.name AS from_shift_name,
+                       ts.name AS to_shift_name
+                FROM duty_transitions t
+                LEFT JOIN shifts fs ON fs.id = t.from_shift_id
+                JOIN shifts ts ON ts.id = t.to_shift_id
+                WHERE t.zone_id = ?
+                ORDER BY t.switched_at DESC, t.id DESC
+                LIMIT 1
+                """,
+                (z["id"],),
+            ).fetchone()
+            z["last_transition"] = dict(last) if last else None
         return zones
 
 
